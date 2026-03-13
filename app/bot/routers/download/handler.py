@@ -1,9 +1,11 @@
 import logging
+from base64 import b64decode, b64encode
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 from aiogram.utils.i18n import gettext as _
+import aiohttp
 from aiohttp.web import HTTPFound, Request, Response
 
 from app.bot.models import ServicesContainer
@@ -14,15 +16,83 @@ from app.bot.utils.constants import (
     MAIN_MESSAGE_ID_KEY,
     PREVIOUS_CALLBACK_KEY,
 )
+from app.bot.utils.network import extract_base_url
 from app.bot.utils.navigation import NavDownload, NavMain
 from app.bot.utils.network import parse_redirect_url
 from app.config import Config
 from app.db.models import User
+from app.db.models import Server, User
 
 from .keyboard import download_keyboard, platforms_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router(name=__name__)
+
+
+def _decode_subscription(raw_data: str) -> list[str]:
+    payload = raw_data.strip()
+    if not payload:
+        return []
+
+    try:
+        decoded = b64decode(payload + "===", validate=False).decode("utf-8")
+        source = decoded
+    except Exception:
+        source = payload
+
+    return [line.strip() for line in source.splitlines() if line.strip()]
+
+
+def _encode_subscription(lines: list[str]) -> str:
+    return b64encode("\n".join(lines).encode("utf-8")).decode("utf-8")
+
+
+async def multiserver_subscription(request: Request) -> Response:
+    vpn_id = request.match_info.get("vpn_id")
+    if not vpn_id:
+        return Response(status=400, text="Missing vpn_id.")
+
+    session_factory = request.app.get("db_session")
+    config: Config = request.app.get("config")
+    if not session_factory or not config:
+        return Response(status=500, text="Application context is not initialized.")
+
+    async with session_factory() as session:
+        user = await User.get_by_vpn_id(session=session, vpn_id=vpn_id)
+        if not user:
+            return Response(status=404, text="Subscription not found.")
+        servers = await Server.get_all(session=session)
+
+    urls = [
+        f"{extract_base_url(server.host, config.xui.SUBSCRIPTION_PORT, config.xui.SUBSCRIPTION_PATH)}{vpn_id}"
+        for server in servers
+        if server.online
+    ]
+
+    if not urls:
+        return Response(status=503, text="No online servers available.")
+
+    configs: list[str] = []
+    async with aiohttp.ClientSession() as client:
+        for url in urls:
+            try:
+                async with client.get(url=url, ssl=False, timeout=10) as response:
+                    if response.status != 200:
+                        continue
+                    body = await response.text()
+                    configs.extend(_decode_subscription(body))
+            except Exception as exception:
+                logger.warning(f"Failed to fetch subscription from {url}: {exception}")
+
+    unique_configs = list(dict.fromkeys(configs))
+    if not unique_configs:
+        return Response(status=404, text="No subscription configs found.")
+
+    return Response(
+        status=200,
+        text=_encode_subscription(unique_configs),
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+    )
 
 
 async def redirect_to_connection(request: Request) -> Response:
@@ -47,7 +117,6 @@ async def redirect_to_connection(request: Request) -> Response:
         raise HTTPFound(redirect_url)
 
     return Response(status=400, reason="Unsupported application.")
-
 
 @router.callback_query(F.data == NavDownload.MAIN)
 async def callback_download(callback: CallbackQuery, user: User, state: FSMContext) -> None:
