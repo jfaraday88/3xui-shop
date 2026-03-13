@@ -101,6 +101,27 @@ class User(Base):
         return None
 
     @classmethod
+    async def get_by_vpn_id(cls, session: AsyncSession, vpn_id: str) -> Self | None:
+        filter = [User.vpn_id == vpn_id]
+        query = await session.execute(
+            select(User)
+            .options(
+                selectinload(User.transactions),
+                selectinload(User.activated_promocodes),
+                selectinload(User.server),
+            )
+            .where(*filter)
+        )
+        user = query.scalar_one_or_none()
+
+        if user:
+            logger.debug(f"User with vpn_id={vpn_id} retrieved from the database.")
+            return user
+
+        logger.debug(f"User with vpn_id={vpn_id} not found in the database.")
+        return None
+    
+    @classmethod
     async def get_all(cls, session: AsyncSession) -> list[Self]:
         query = await session.execute(select(User).options(selectinload(User.server)))
         return query.scalars().all()
