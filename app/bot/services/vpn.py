@@ -6,18 +6,19 @@ if TYPE_CHECKING:
     from .server_pool import ServerPoolService
 
 import logging
+from urllib.parse import urljoin
 
 from py3xui import Client, Inbound
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.bot.models import ClientData
-from app.bot.utils.network import extract_base_url
 from app.bot.utils.time import (
     add_days_to_timestamp,
     days_to_timestamp,
     get_current_timestamp,
 )
 from app.config import Config
+from app.bot.utils.constants import MULTISERVER_SUBSCRIPTION_WEBHOOK
 from app.db.models import Promocode, User
 
 logger = logging.getLogger(__name__)
@@ -119,16 +120,16 @@ class VPNService:
         async with self.session() as session:
             user = await User.get(session=session, tg_id=user.tg_id)
 
-        if not user.server_id:
-            logger.debug(f"Server ID for user {user.tg_id} not found.")
+        if not user:
             return None
 
-        subscription = extract_base_url(
-            url=user.server.host,
-            port=self.config.xui.SUBSCRIPTION_PORT,
-            path=self.config.xui.SUBSCRIPTION_PATH,
+        if not user.vpn_id:
+            logger.debug(f"VPN ID for user {user.tg_id} not found.")
+            return None
+
+        key = urljoin(self.config.bot.DOMAIN, MULTISERVER_SUBSCRIPTION_WEBHOOK).replace(
+            "{vpn_id}", user.vpn_id
         )
-        key = f"{subscription}{user.vpn_id}"
         logger.debug(f"Fetched key for {user.tg_id}: {key}.")
         return key
 
