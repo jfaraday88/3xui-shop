@@ -111,7 +111,9 @@ async def main() -> None:
         session=db.session,
         bot=bot,
     )
-
+    app["config"] = config
+    app["db_session"] = db.session
+    
     # Sync servers
     await services_container.server_pool.sync_servers()
 
