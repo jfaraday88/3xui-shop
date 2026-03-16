@@ -3,15 +3,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .server_pool import ServerPoolService
+    from .server_pool import Connection, ServerPoolService
 
 import logging
+from urllib.parse import urljoin
 
-from py3xui import Client, Inbound
+from py3xui import AsyncApi, Client, Inbound
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.bot.models import ClientData
-from app.bot.utils.network import extract_base_url
+from app.bot.utils.constants import MULTISERVER_SUBSCRIPTION_WEBHOOK
 from app.bot.utils.time import (
     add_days_to_timestamp,
     days_to_timestamp,
@@ -56,20 +57,7 @@ class VPNService:
         if not connection:
             return None
 
-        try:
-            inbounds: list[Inbound] = await connection.api.inbound.get_list()
-        except Exception as exception:
-            logger.error(f"Failed to fetch inbounds: {exception}")
-            return None
-
-        for inbound in inbounds:
-            for inbound_client in inbound.settings.clients:
-                if inbound_client.email == client.email:
-                    logger.debug(f"Client {client.email} limit ip: {inbound_client.limit_ip}")
-                    return inbound_client.limit_ip
-
-        logger.critical(f"Client {client.email} not found in inbounds.")
-        return None
+        return await self._get_limit_ip_from_api(api=connection.api, client=client)
 
     async def get_client_data(self, user: User) -> ClientData | None:
         logger.debug(f"Starting to retrieve client data for {user.tg_id}.")
@@ -119,35 +107,55 @@ class VPNService:
         async with self.session() as session:
             user = await User.get(session=session, tg_id=user.tg_id)
 
-        if not user.server_id:
-            logger.debug(f"Server ID for user {user.tg_id} not found.")
+        if not user:
             return None
 
-        subscription = extract_base_url(
-            url=user.server.host,
-            port=self.config.xui.SUBSCRIPTION_PORT,
-            path=self.config.xui.SUBSCRIPTION_PATH,
+        if not user.vpn_id:
+            logger.debug(f"VPN ID for user {user.tg_id} not found.")
+            return None
+
+        key = urljoin(self.config.bot.DOMAIN, MULTISERVER_SUBSCRIPTION_WEBHOOK).replace(
+            "{vpn_id}", user.vpn_id
         )
-        key = f"{subscription}{user.vpn_id}"
         logger.debug(f"Fetched key for {user.tg_id}: {key}.")
         return key
 
-    async def create_client(
+    async def _get_client_from_api(self, api: AsyncApi, user: User) -> Client | None:
+        try:
+            return await api.client.get_by_email(str(user.tg_id))
+        except Exception as exception:
+            logger.error(f"Error getting client {user.tg_id}: {exception}")
+            return None
+
+    async def _get_limit_ip_from_api(self, api: AsyncApi, client: Client) -> int | None:
+        try:
+            inbounds: list[Inbound] = await api.inbound.get_list()
+        except Exception as exception:
+            logger.error(f"Failed to fetch inbounds: {exception}")
+            return None
+
+        for inbound in inbounds:
+            for inbound_client in inbound.settings.clients:
+                if inbound_client.email == client.email:
+                    logger.debug(f"Client {client.email} limit ip: {inbound_client.limit_ip}")
+                    return inbound_client.limit_ip
+
+        logger.critical(f"Client {client.email} not found in inbounds.")
+        return None
+
+    async def _create_client_on_api(
         self,
+        api: AsyncApi,
         user: User,
         devices: int,
         duration: int,
         enable: bool = True,
         flow: str = "xtls-rprx-vision",
         total_gb: int = 0,
-        inbound_id: int = 1,
     ) -> bool:
-        logger.info(f"Creating new client {user.tg_id} | {devices} devices {duration} days.")
-
-        await self.server_pool_service.assign_server_to_user(user)
-        connection = await self.server_pool_service.get_connection(user)
-
-        if not connection:
+        inbound_id = await self.server_pool_service.get_inbound_id(api)
+        if inbound_id is None:
+            logger.error("Failed to get inbound id for client creation.")
             return False
 
         new_client = Client(
@@ -160,18 +168,17 @@ class VPNService:
             sub_id=user.vpn_id,
             total_gb=total_gb,
         )
-        inbound_id = await self.server_pool_service.get_inbound_id(connection.api)
 
         try:
-            await connection.api.client.add(inbound_id=inbound_id, clients=[new_client])
-            logger.info(f"Successfully created client for {user.tg_id}")
+            await api.client.add(inbound_id=inbound_id, clients=[new_client])
             return True
         except Exception as exception:
             logger.error(f"Error creating client for {user.tg_id}: {exception}")
             return False
 
-    async def update_client(
+    async def _update_client_on_api(
         self,
+        api: AsyncApi,
         user: User,
         devices: int,
         duration: int,
@@ -181,21 +188,18 @@ class VPNService:
         flow: str = "xtls-rprx-vision",
         total_gb: int = 0,
     ) -> bool:
-        logger.info(f"Updating client {user.tg_id} | {devices} devices {duration} days.")
-        connection = await self.server_pool_service.get_connection(user)
-
-        if not connection:
-            return False
-
         try:
-            client = await connection.api.client.get_by_email(str(user.tg_id))
+            client = await self._get_client_from_api(api=api, user=user)
 
             if client is None:
                 logger.critical(f"Client {user.tg_id} not found for update.")
                 return False
 
             if not replace_devices:
-                current_device_limit = await self.get_limit_ip(user=user, client=client)
+                current_device_limit = await self._get_limit_ip_from_api(api=api, client=client)
+                if current_device_limit is None:
+                    logger.error(f"Could not resolve current device limit for {user.tg_id}.")
+                    return False
                 devices = current_device_limit + devices
 
             current_time = get_current_timestamp()
@@ -215,20 +219,208 @@ class VPNService:
             client.sub_id = user.vpn_id
             client.total_gb = total_gb
 
-            await connection.api.client.update(client_uuid=client.id, client=client)
-            logger.info(f"Client {user.tg_id} updated successfully.")
+            await api.client.update(client_uuid=client.id, client=client)
             return True
         except Exception as exception:
             logger.error(f"Error updating client {user.tg_id}: {exception}")
             return False
 
+    async def create_client(
+        self,
+        user: User,
+        devices: int,
+        duration: int,
+        enable: bool = True,
+        flow: str = "xtls-rprx-vision",
+        total_gb: int = 0,
+        inbound_id: int = 1,
+    ) -> bool:
+        logger.info(f"Creating new client {user.tg_id} | {devices} devices {duration} days.")
+
+        await self.server_pool_service.assign_server_to_user(user)
+        connection = await self.server_pool_service.get_connection(user)
+
+        if not connection:
+            return False
+
+        created = await self._create_client_on_api(
+            api=connection.api,
+            user=user,
+            devices=devices,
+            duration=duration,
+            enable=enable,
+            flow=flow,
+            total_gb=total_gb,
+        )
+
+        if created:
+            logger.info(f"Successfully created client for {user.tg_id}")
+
+        return created
+
+    async def create_clients_on_all_servers(
+        self,
+        user: User,
+        devices: int,
+        duration: int,
+        enable: bool = True,
+        flow: str = "xtls-rprx-vision",
+        total_gb: int = 0,
+    ) -> bool:
+        connections = await self.server_pool_service.get_online_connections()
+
+        if not connections:
+            logger.error("No online servers found to create clients.")
+            return False
+
+        success_count = 0
+        for connection in connections:
+            exists = await self._get_client_from_api(api=connection.api, user=user)
+            if exists:
+                logger.debug(
+                    f"Client {user.tg_id} already exists on server {connection.server.name}, skipping create."
+                )
+                success_count += 1
+                continue
+
+            created = await self._create_client_on_api(
+                api=connection.api,
+                user=user,
+                devices=devices,
+                duration=duration,
+                enable=enable,
+                flow=flow,
+                total_gb=total_gb,
+            )
+            if created:
+                success_count += 1
+
+        logger.info(
+            f"Created or found client {user.tg_id} on {success_count}/{len(connections)} servers."
+        )
+        return success_count > 0
+
+    async def _upsert_client_on_connections(
+        self,
+        user: User,
+        devices: int,
+        duration: int,
+        replace_devices: bool,
+        replace_duration: bool,
+        enable: bool = True,
+        flow: str = "xtls-rprx-vision",
+        total_gb: int = 0,
+    ) -> bool:
+        connections = await self.server_pool_service.get_online_connections()
+
+        if not connections:
+            logger.error("No online servers found to upsert clients.")
+            return False
+
+        success_count = 0
+        for connection in connections:
+            existing_client = await self._get_client_from_api(api=connection.api, user=user)
+            if existing_client:
+                updated = await self._update_client_on_api(
+                    api=connection.api,
+                    user=user,
+                    devices=devices,
+                    duration=duration,
+                    replace_devices=replace_devices,
+                    replace_duration=replace_duration,
+                    enable=enable,
+                    flow=flow,
+                    total_gb=total_gb,
+                )
+                if updated:
+                    success_count += 1
+                continue
+
+            created = await self._create_client_on_api(
+                api=connection.api,
+                user=user,
+                devices=devices,
+                duration=duration,
+                enable=enable,
+                flow=flow,
+                total_gb=total_gb,
+            )
+            if created:
+                success_count += 1
+
+        logger.info(f"Upserted client {user.tg_id} on {success_count}/{len(connections)} servers.")
+        return success_count > 0
+
+    async def update_client(
+        self,
+        user: User,
+        devices: int,
+        duration: int,
+        replace_devices: bool = False,
+        replace_duration: bool = False,
+        enable: bool = True,
+        flow: str = "xtls-rprx-vision",
+        total_gb: int = 0,
+    ) -> bool:
+        logger.info(f"Updating client {user.tg_id} | {devices} devices {duration} days.")
+        connection = await self.server_pool_service.get_connection(user)
+
+        if not connection:
+            return False
+
+        updated = await self._update_client_on_api(
+            api=connection.api,
+            user=user,
+            devices=devices,
+            duration=duration,
+            replace_devices=replace_devices,
+            replace_duration=replace_duration,
+            enable=enable,
+            flow=flow,
+            total_gb=total_gb,
+        )
+
+        if updated:
+            logger.info(f"Client {user.tg_id} updated successfully.")
+
+        return updated
+
+    async def update_client_on_all_servers(
+        self,
+        user: User,
+        devices: int,
+        duration: int,
+        replace_devices: bool = False,
+        replace_duration: bool = False,
+        enable: bool = True,
+        flow: str = "xtls-rprx-vision",
+        total_gb: int = 0,
+    ) -> bool:
+        return await self._upsert_client_on_connections(
+            user=user,
+            devices=devices,
+            duration=duration,
+            replace_devices=replace_devices,
+            replace_duration=replace_duration,
+            enable=enable,
+            flow=flow,
+            total_gb=total_gb,
+        )
+
     async def create_subscription(self, user: User, devices: int, duration: int) -> bool:
-        if not await self.is_client_exists(user):
-            return await self.create_client(user=user, devices=devices, duration=duration)
-        return False
+        created = await self.create_clients_on_all_servers(
+            user=user,
+            devices=devices,
+            duration=duration,
+        )
+
+        if created and not user.server_id:
+            await self.server_pool_service.assign_server_to_user(user)
+
+        return created
 
     async def extend_subscription(self, user: User, devices: int, duration: int) -> bool:
-        return await self.update_client(
+        return await self.update_client_on_all_servers(
             user=user,
             devices=devices,
             duration=duration,
@@ -236,29 +428,22 @@ class VPNService:
         )
 
     async def change_subscription(self, user: User, devices: int, duration: int) -> bool:
-        if await self.is_client_exists(user):
-            return await self.update_client(
-                user,
-                devices,
-                duration,
-                replace_devices=True,
-                replace_duration=True,
-            )
-        return False
+        return await self.update_client_on_all_servers(
+            user=user,
+            devices=devices,
+            duration=duration,
+            replace_devices=True,
+            replace_duration=True,
+        )
 
     async def process_bonus_days(self, user: User, duration: int, devices: int) -> bool:
-        if await self.is_client_exists(user):
-            updated = await self.update_client(user=user, devices=0, duration=duration)
-            if updated:
-                logger.info(f"Updated client {user.tg_id} with additional {duration} days(-s).")
-                return True
-        else:
-            created = await self.create_client(user=user, devices=devices, duration=duration)
-            if created:
-                logger.info(f"Created client {user.tg_id} with additional {duration} days(-s)")
-                return True
-
-        return False
+        return await self._upsert_client_on_connections(
+            user=user,
+            devices=devices,
+            duration=duration,
+            replace_devices=False,
+            replace_duration=False,
+        )
 
     async def activate_promocode(self, user: User, promocode: Promocode) -> bool:
         # TODO: consider moving to some 'promocode module services' with usage of vpn-service methods.
