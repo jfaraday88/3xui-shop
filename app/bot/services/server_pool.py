@@ -100,6 +100,10 @@ class ServerPoolService:
         connection.server = server
         return connection
 
+    async def get_online_connections(self) -> list[Connection]:
+        await self.sync_servers()
+        return [conn for conn in self._servers.values() if conn.server.online]
+    
     async def sync_servers(self) -> None:
         async with self.session() as session:
             db_servers = await Server.get_all(session)
